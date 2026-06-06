@@ -80,8 +80,17 @@ export function requireSandboxBackendFactory(id: string): SandboxBackendFactory 
   );
 }
 
+import {
+  agentBenchSandboxBackendManager,
+  createAgentBenchSandboxBackend,
+} from "./agent-bench-backend.js";
 import { createDockerSandboxBackend, dockerSandboxBackendManager } from "./docker-backend.js";
 import { createSshSandboxBackend, sshSandboxBackendManager } from "./ssh-backend.js";
+
+registerSandboxBackend("agent-bench", {
+  factory: createAgentBenchSandboxBackend,
+  manager: agentBenchSandboxBackendManager,
+});
 
 registerSandboxBackend("docker", {
   factory: createDockerSandboxBackend,

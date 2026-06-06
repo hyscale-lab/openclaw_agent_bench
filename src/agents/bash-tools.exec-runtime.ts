@@ -795,6 +795,7 @@ export async function runExecProcess(opts: {
         workdir: opts.containerWorkdir ?? opts.sandbox.containerWorkdir,
         env: shellRuntimeEnv,
         usePty: opts.usePty,
+        timeoutMs,
       });
       sandboxFinalizeToken = backendExecSpec?.finalizeToken;
       return {

@@ -53,6 +53,7 @@ export type SandboxBackendHandle = {
     workdir?: string;
     env: Record<string, string>;
     usePty: boolean;
+    timeoutMs?: number;
   }): Promise<SandboxBackendExecSpec>;
   finalizeExec?: (params: {
     status: "completed" | "failed";
