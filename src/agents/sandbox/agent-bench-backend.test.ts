@@ -79,7 +79,7 @@ describe("agent-bench sandbox backend", () => {
       timeoutMs: 5000,
     });
 
-    expect(spec.stdinMode).toBe("pipe-open");
+    expect(spec.stdinMode).toBe("pipe-closed");
     expect(spec.argv[0]).toBe(process.execPath);
     expect(optionValue(spec.argv, "--cwd")).toBe("/app/pkg");
     expect(JSON.parse(optionValue(spec.argv, "--argv-json"))).toEqual([
@@ -89,6 +89,10 @@ describe("agent-bench sandbox backend", () => {
     ]);
     expect(JSON.parse(optionValue(spec.argv, "--env-json"))).toEqual({
       PYTHONUNBUFFERED: "1",
+      AGENT_BENCH_OPENCLAW_SESSION_KEY: "agent:terminal_bench:session-1",
+      AGENT_BENCH_OPENCLAW_SANDBOX_BACKEND: "agent-bench",
+      AGENT_BENCH_OPENCLAW_SANDBOX_NAME: "tb-sandbox",
+      AGENT_BENCH_OPENCLAW_TOOL_OPERATION: "exec",
     });
     expect(optionValue(spec.argv, "--timeout-ms")).toBe("5000");
     expect(spec.env[AGENT_BENCH_TOOL_BRIDGE_ENDPOINT_ENV]).toBe("http://127.0.0.1:19010/v1/exec");
@@ -140,6 +144,12 @@ describe("agent-bench sandbox backend", () => {
             "openclaw-sandbox-fs",
             "arg-one",
           ]);
+          expect(payload.env).toMatchObject({
+            AGENT_BENCH_OPENCLAW_SESSION_KEY: "agent:terminal_bench:session-1",
+            AGENT_BENCH_OPENCLAW_SANDBOX_BACKEND: "agent-bench",
+            AGENT_BENCH_OPENCLAW_SANDBOX_NAME: "tb-sandbox",
+            AGENT_BENCH_OPENCLAW_TOOL_OPERATION: "fs",
+          });
           expect(payload.stdin_b64).toBe(Buffer.from("input").toString("base64"));
           expect(payload.timeout_ms).toBe(300000);
         },

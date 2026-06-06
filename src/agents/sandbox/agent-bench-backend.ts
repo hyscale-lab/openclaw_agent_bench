@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
 import type {
   SandboxBackendCommandParams,
   SandboxBackendCommandResult,
@@ -272,6 +273,29 @@ function resolveRequestTimeoutMs(...candidates: Array<number | undefined>): numb
   return DEFAULT_TOOL_BRIDGE_TIMEOUT_MS;
 }
 
+async function appendAgentBenchBackendDiagnostic(entry: Record<string, unknown>): Promise<void> {
+  const logsPath = readTrimmedEnv(AGENT_BENCH_TOOL_BRIDGE_LOG_PATH_ENV);
+  if (!logsPath) {
+    return;
+  }
+  try {
+    const logsDir = logsPath.includes("/") ? logsPath.replace(/\/[^/]*$/, "") : ".";
+    await fs.mkdir(logsDir, { recursive: true });
+    await fs.appendFile(
+      logsPath,
+      `${JSON.stringify({
+        component: "openclaw-agent-bench-backend",
+        timestamp: new Date().toISOString(),
+        ...entry,
+      })}
+`,
+      "utf8",
+    );
+  } catch {
+    // Diagnostics must never break tool execution.
+  }
+}
+
 function resolveToolBridgeExecUrl(endpoint: string): string {
   let url: URL;
   try {
@@ -332,6 +356,43 @@ function buildBridgeHttpClientEnv(
   env[AGENT_BENCH_SANDBOX_WORKSPACE_DIR_ENV] = runtime.workspaceDir;
   env[AGENT_BENCH_SANDBOX_AGENT_WORKSPACE_DIR_ENV] = runtime.agentWorkspaceDir;
   return env;
+}
+
+function bridgeRequestMetadataEnv(
+  runtime: AgentBenchBridgeRuntime,
+  sessionKey: string,
+  operation: string,
+): Record<string, string> {
+  const metadata: Record<string, string> = {
+    AGENT_BENCH_OPENCLAW_SESSION_KEY: sessionKey,
+    AGENT_BENCH_OPENCLAW_SANDBOX_BACKEND: "agent-bench",
+    AGENT_BENCH_OPENCLAW_SANDBOX_NAME: runtime.sandboxName,
+    AGENT_BENCH_OPENCLAW_TOOL_OPERATION: operation,
+  };
+  for (const key of [
+    AGENT_BENCH_RUN_ID_ENV,
+    AGENT_BENCH_RUN_NAME_ENV,
+    AGENT_BENCH_BENCHMARK_KIND_ENV,
+    AGENT_BENCH_BENCHMARK_TASK_ID_ENV,
+  ]) {
+    const value = readTrimmedEnv(key);
+    if (value) {
+      metadata[key] = value;
+    }
+  }
+  return metadata;
+}
+
+function buildBridgeRequestEnv(params: {
+  env?: Record<string, string>;
+  runtime: AgentBenchBridgeRuntime;
+  sessionKey: string;
+  operation: string;
+}): Record<string, string> {
+  return {
+    ...(params.env ?? {}),
+    ...bridgeRequestMetadataEnv(params.runtime, params.sessionKey, params.operation),
+  };
 }
 
 export function buildAgentBenchBridgeHttpClientArgv(
@@ -453,6 +514,15 @@ export async function createAgentBenchSandboxBackend(
   params: CreateSandboxBackendParams,
 ): Promise<SandboxBackendHandle> {
   const runtime = resolveAgentBenchRuntime(params);
+  await appendAgentBenchBackendDiagnostic({
+    type: "backend_created",
+    sessionKey: params.sessionKey,
+    sandboxName: runtime.sandboxName,
+    endpoint: runtime.endpoint,
+    workdir: runtime.workdir,
+    workspaceDir: runtime.workspaceDir,
+    agentWorkspaceDir: runtime.agentWorkspaceDir,
+  });
   const handle: SandboxBackendHandle & RemoteShellSandboxHandle = {
     id: "agent-bench",
     runtimeId: runtime.sandboxName,
@@ -462,21 +532,60 @@ export async function createAgentBenchSandboxBackend(
     configLabelKind: "Sandbox",
     remoteWorkspaceDir: runtime.workspaceDir,
     remoteAgentWorkspaceDir: runtime.agentWorkspaceDir,
-    buildExecSpec: async ({ command, workdir, env, timeoutMs }) => ({
-      argv: buildAgentBenchBridgeHttpClientArgv({
-        cwd: workdir ?? runtime.workdir,
-        argv: ["/bin/sh", "-lc", command],
-        env,
-        timeoutMs: resolveRequestTimeoutMs(timeoutMs, runtime.commandTimeoutMs),
-      }),
-      env: buildBridgeHttpClientEnv(runtime, params.sessionKey),
-      stdinMode: "pipe-open",
-    }),
+    buildExecSpec: async ({ command, workdir, env, timeoutMs }) => {
+      const cwd = workdir ?? runtime.workdir;
+      const argv = ["/bin/sh", "-lc", command];
+      await appendAgentBenchBackendDiagnostic({
+        type: "build_exec_spec",
+        sessionKey: params.sessionKey,
+        cwd,
+        argv,
+      });
+      return {
+        argv: buildAgentBenchBridgeHttpClientArgv({
+          cwd,
+          argv,
+          env: buildBridgeRequestEnv({
+            env,
+            runtime,
+            sessionKey: params.sessionKey,
+            operation: "exec",
+          }),
+          timeoutMs: resolveRequestTimeoutMs(timeoutMs, runtime.commandTimeoutMs),
+        }),
+        env: buildBridgeHttpClientEnv(runtime, params.sessionKey),
+        stdinMode: "pipe-closed",
+      };
+    },
     runShellCommand: async (command) => {
+      const argv = [
+        "/bin/sh",
+        "-c",
+        command.script,
+        "openclaw-sandbox-fs",
+        ...(command.args ?? []),
+      ];
+      await appendAgentBenchBackendDiagnostic({
+        type: "run_shell_command",
+        sessionKey: params.sessionKey,
+        cwd: runtime.workspaceDir,
+        argv,
+        stdinSize:
+          command.stdin === undefined
+            ? 0
+            : Buffer.isBuffer(command.stdin)
+              ? command.stdin.length
+              : Buffer.byteLength(command.stdin),
+      });
       const result = await postExecRequest({
         runtime,
         cwd: runtime.workspaceDir,
-        argv: ["/bin/sh", "-c", command.script, "openclaw-sandbox-fs", ...(command.args ?? [])],
+        argv,
+        env: buildBridgeRequestEnv({
+          runtime,
+          sessionKey: params.sessionKey,
+          operation: "fs",
+        }),
         stdin: command.stdin,
         timeoutMs: runtime.commandTimeoutMs,
         signal: command.signal,
