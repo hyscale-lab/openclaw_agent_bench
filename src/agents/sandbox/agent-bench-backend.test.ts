@@ -148,6 +148,43 @@ describe("agent-bench sandbox backend", () => {
   );
 
   it.runIf(process.platform !== "win32")(
+    "keeps filesystem write payload on stdin instead of argv",
+    async () => {
+      const markdown = Buffer.from("# Summary\nRequest completed.\n\n# Checks\n/app exists.\n");
+      await withFakeBridgeServer(
+        async (request) => {
+          expect(request.body.argv).toEqual([
+            "/bin/sh",
+            "-c",
+            "printf helper",
+            "openclaw-sandbox-fs",
+            "write",
+            "/app",
+            "",
+            "answer.md",
+            "1",
+          ]);
+          expect(request.body.argv.join(" ")).not.toContain("# Summary");
+          expect(request.body.stdin_b64).toBe(markdown.toString("base64"));
+          return execResponse(request.body);
+        },
+        async (endpoint) => {
+          stubRequiredAgentBenchEnv({ endpoint });
+
+          const backend = await createAgentBenchSandboxBackend(createBackendParams());
+          const result = await backend.runShellCommand({
+            script: "printf helper",
+            args: ["write", "/app", "", "answer.md", "1"],
+            stdin: markdown,
+          });
+
+          expect(result.code).toBe(0);
+        },
+      );
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
     "throws on bridge failure unless allowFailure is set",
     async () => {
       await withFakeBridgeServer(
