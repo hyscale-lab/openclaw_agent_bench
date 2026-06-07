@@ -4,8 +4,10 @@ import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  AGENT_BENCH_OPENCLAW_TOOL_CONFIG_PATH_ENV,
   AGENT_BENCH_SANDBOX_NAME_ENV,
   AGENT_BENCH_TOOL_BRIDGE_ENDPOINT_ENV,
+  AGENT_BENCH_TOOL_SERVICE_ENDPOINT_ENV,
   agentBenchSandboxBackendManager,
   buildAgentBenchBridgeHttpClientArgv,
   createAgentBenchSandboxBackend,
@@ -40,6 +42,29 @@ type CapturedBridgeRequest = {
   method: string | undefined;
   url: string | undefined;
   body: ExecRequestBody;
+};
+
+type ToolCallRequestBody = {
+  type: "tool_call";
+  id: string;
+  canonical_tool: string;
+  input: Record<string, unknown>;
+  metadata: Record<string, string>;
+};
+
+type ToolCallResponseBody = {
+  type: "tool_result";
+  id: string;
+  canonical_tool: string;
+  ok: boolean;
+  output: Record<string, unknown>;
+  error?: string;
+};
+
+type CapturedToolCallRequest = {
+  method: string | undefined;
+  url: string | undefined;
+  body: ToolCallRequestBody;
 };
 
 afterEach(() => {
@@ -285,6 +310,70 @@ describe("agent-bench sandbox backend", () => {
     },
   );
 
+  it.runIf(process.platform !== "win32")(
+    "uses structured tool service filesystem bridge when OpenClaw tool map is configured",
+    async () => {
+      await withTempDir("openclaw-agent-bench-tool-service-", async (stateDir) => {
+        const workspaceDir = path.join(stateDir, "workspace");
+        await fs.mkdir(workspaceDir, { recursive: true });
+        const toolMapPath = path.join(stateDir, "openclaw-tool-map.json");
+        await fs.writeFile(
+          toolMapPath,
+          JSON.stringify({
+            endpoint: "http://127.0.0.1:19010/v1/tool-call",
+            mappings: {
+              "openclaw.read.readFile": "openclaw.fs.read_file",
+              "openclaw.read.access": "openclaw.fs.stat",
+            },
+          }),
+          "utf8",
+        );
+        await withFakeToolServiceServer(
+          async (request) => {
+            expect(request.method).toBe("POST");
+            expect(request.url).toBe("/v1/tool-call");
+            expect(request.body.canonical_tool).toBe("openclaw.fs.read_file");
+            expect(request.body.input).toEqual({ cwd: "/app", path: "note.txt" });
+            expect(request.body.metadata).toMatchObject({
+              AGENT_BENCH_OPENCLAW_SESSION_KEY: "agent:terminal_bench:session-1",
+              AGENT_BENCH_OPENCLAW_TOOL_OPERATION: "openclaw.read.readFile",
+              AGENT_BENCH_OPENCLAW_SANDBOX_NAME: "tb-sandbox",
+            });
+            return toolCallResponse(request.body, {
+              output: {
+                data_b64: BINARY_READ_OUTPUT.toString("base64"),
+                size: BINARY_READ_OUTPUT.length,
+              },
+            });
+          },
+          async (endpoint) => {
+            stubRequiredAgentBenchEnv({ endpoint });
+            vi.stubEnv(AGENT_BENCH_OPENCLAW_TOOL_CONFIG_PATH_ENV, toolMapPath);
+            vi.stubEnv(AGENT_BENCH_TOOL_SERVICE_ENDPOINT_ENV, `${endpoint}/v1/tool-call`);
+
+            const backend = await createAgentBenchSandboxBackend(
+              createBackendParams({ workspaceDir, agentWorkspaceDir: workspaceDir }),
+            );
+            const bridge = backend.createFsBridge?.({
+              sandbox: createSandboxTestContext({
+                overrides: {
+                  workspaceDir,
+                  agentWorkspaceDir: workspaceDir,
+                  workspaceAccess: "rw",
+                  containerWorkdir: "/app",
+                },
+              }),
+            });
+
+            await expect(
+              bridge?.readFile({ filePath: path.join(workspaceDir, "note.txt") }),
+            ).resolves.toEqual(BINARY_READ_OUTPUT);
+          },
+        );
+      });
+    },
+  );
+
   it("does not claim ownership of sandbox removal", async () => {
     stubRequiredAgentBenchEnv({ endpoint: "http://127.0.0.1:19010" });
 
@@ -401,6 +490,48 @@ async function withFakeBridgeServer<T>(
   }
 }
 
+async function withFakeToolServiceServer<T>(
+  handler: (
+    request: CapturedToolCallRequest,
+  ) => Promise<ToolCallResponseBody> | ToolCallResponseBody,
+  run: (endpoint: string) => Promise<T>,
+): Promise<T> {
+  const server = http.createServer(async (request, response) => {
+    try {
+      if (request.method !== "POST" || request.url !== "/v1/tool-call") {
+        response.writeHead(404).end("not found");
+        return;
+      }
+      const body = JSON.parse(
+        (await readRequestBody(request)).toString("utf8"),
+      ) as ToolCallRequestBody;
+      const result = await handler({
+        method: request.method,
+        url: request.url,
+        body,
+      });
+      response.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify(result));
+    } catch (error) {
+      response.writeHead(500, { "content-type": "text/plain" }).end(String(error));
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address() as AddressInfo;
+  try {
+    return await run(`http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+}
+
 async function handleBridgeRequest(
   request: IncomingMessage,
   response: ServerResponse,
@@ -424,6 +555,24 @@ async function handleBridgeRequest(
   } catch (error) {
     response.writeHead(500, { "content-type": "text/plain" }).end(String(error));
   }
+}
+
+function toolCallResponse(
+  request: ToolCallRequestBody,
+  params: {
+    ok?: boolean;
+    output?: Record<string, unknown>;
+    error?: string;
+  } = {},
+): ToolCallResponseBody {
+  return {
+    type: "tool_result",
+    id: request.id,
+    canonical_tool: request.canonical_tool,
+    ok: params.ok ?? true,
+    output: params.output ?? {},
+    ...(params.error ? { error: params.error } : {}),
+  };
 }
 
 async function readRequestBody(request: IncomingMessage): Promise<Buffer> {

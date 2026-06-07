@@ -1,5 +1,11 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import {
+  createAgentBenchToolServiceFsBridge,
+  normalizeAgentBenchToolServiceEndpoint,
+  parseAgentBenchToolMap,
+  type AgentBenchToolServiceRuntime,
+} from "./agent-bench-tool-service-fs-bridge.js";
 import type {
   SandboxBackendCommandParams,
   SandboxBackendCommandResult,
@@ -16,6 +22,8 @@ import {
 import { sanitizeEnvVars } from "./sanitize-env-vars.js";
 
 export const AGENT_BENCH_TOOL_BRIDGE_ENDPOINT_ENV = "AGENT_BENCH_TOOL_BRIDGE_ENDPOINT";
+export const AGENT_BENCH_TOOL_SERVICE_ENDPOINT_ENV = "AGENT_BENCH_TOOL_SERVICE_ENDPOINT";
+export const AGENT_BENCH_OPENCLAW_TOOL_CONFIG_PATH_ENV = "AGENT_BENCH_OPENCLAW_TOOL_CONFIG_PATH";
 export const AGENT_BENCH_TOOL_BRIDGE_LOG_PATH_ENV = "AGENT_BENCH_TOOL_BRIDGE_LOG_PATH";
 export const AGENT_BENCH_SANDBOX_NAME_ENV = "AGENT_BENCH_SANDBOX_NAME";
 export const AGENT_BENCH_SANDBOX_WORKDIR_ENV = "AGENT_BENCH_SANDBOX_WORKDIR";
@@ -33,6 +41,8 @@ const DEFAULT_TOOL_BRIDGE_TIMEOUT_MS = 300_000;
 
 const BRIDGE_HTTP_PASS_THROUGH_ENV = [
   AGENT_BENCH_TOOL_BRIDGE_ENDPOINT_ENV,
+  AGENT_BENCH_TOOL_SERVICE_ENDPOINT_ENV,
+  AGENT_BENCH_OPENCLAW_TOOL_CONFIG_PATH_ENV,
   AGENT_BENCH_TOOL_BRIDGE_LOG_PATH_ENV,
   AGENT_BENCH_TOOL_BRIDGE_COMMAND_TIMEOUT_MS_ENV,
   AGENT_BENCH_SANDBOX_NAME_ENV,
@@ -52,6 +62,7 @@ type AgentBenchBridgeRuntime = {
   workspaceDir: string;
   agentWorkspaceDir: string;
   commandTimeoutMs?: number;
+  toolService?: Pick<AgentBenchToolServiceRuntime, "endpoint" | "mappings">;
 };
 
 export type AgentBenchBridgeHttpClientArgvParams = {
@@ -320,7 +331,32 @@ function resolveToolBridgeExecUrl(endpoint: string): string {
   return url.toString();
 }
 
-function resolveAgentBenchRuntime(params: CreateSandboxBackendParams): AgentBenchBridgeRuntime {
+async function resolveAgentBenchToolService(): Promise<
+  Pick<AgentBenchToolServiceRuntime, "endpoint" | "mappings"> | undefined
+> {
+  const configPath = readTrimmedEnv(AGENT_BENCH_OPENCLAW_TOOL_CONFIG_PATH_ENV);
+  if (!configPath) {
+    return undefined;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await fs.readFile(configPath, "utf8"));
+  } catch (error) {
+    throw new Error(`Agent Bench OpenClaw tool config could not be read: ${String(error)}`);
+  }
+  const toolMap = parseAgentBenchToolMap(parsed);
+  const endpointOverride = readTrimmedEnv(AGENT_BENCH_TOOL_SERVICE_ENDPOINT_ENV);
+  return {
+    endpoint: endpointOverride
+      ? normalizeAgentBenchToolServiceEndpoint(endpointOverride)
+      : toolMap.endpoint,
+    mappings: toolMap.mappings,
+  };
+}
+
+async function resolveAgentBenchRuntime(
+  params: CreateSandboxBackendParams,
+): Promise<AgentBenchBridgeRuntime> {
   const workdir = readTrimmedEnv(AGENT_BENCH_SANDBOX_WORKDIR_ENV) ?? params.cfg.docker.workdir;
   const workspaceDir = readTrimmedEnv(AGENT_BENCH_SANDBOX_WORKSPACE_DIR_ENV) ?? workdir;
   const agentWorkspaceDir =
@@ -333,6 +369,7 @@ function resolveAgentBenchRuntime(params: CreateSandboxBackendParams): AgentBenc
     workspaceDir,
     agentWorkspaceDir,
     commandTimeoutMs: parsePositiveIntegerEnv(AGENT_BENCH_TOOL_BRIDGE_COMMAND_TIMEOUT_MS_ENV),
+    toolService: await resolveAgentBenchToolService(),
   };
 }
 
@@ -369,6 +406,22 @@ function bridgeRequestMetadataEnv(
     AGENT_BENCH_OPENCLAW_SANDBOX_NAME: runtime.sandboxName,
     AGENT_BENCH_OPENCLAW_TOOL_OPERATION: operation,
   };
+  for (const key of [
+    AGENT_BENCH_RUN_ID_ENV,
+    AGENT_BENCH_RUN_NAME_ENV,
+    AGENT_BENCH_BENCHMARK_KIND_ENV,
+    AGENT_BENCH_BENCHMARK_TASK_ID_ENV,
+  ]) {
+    const value = readTrimmedEnv(key);
+    if (value) {
+      metadata[key] = value;
+    }
+  }
+  return metadata;
+}
+
+function agentBenchRunMetadataEnv(): Record<string, string> {
+  const metadata: Record<string, string> = {};
   for (const key of [
     AGENT_BENCH_RUN_ID_ENV,
     AGENT_BENCH_RUN_NAME_ENV,
@@ -513,12 +566,13 @@ export const agentBenchSandboxBackendManager: SandboxBackendManager = {
 export async function createAgentBenchSandboxBackend(
   params: CreateSandboxBackendParams,
 ): Promise<SandboxBackendHandle> {
-  const runtime = resolveAgentBenchRuntime(params);
+  const runtime = await resolveAgentBenchRuntime(params);
   await appendAgentBenchBackendDiagnostic({
     type: "backend_created",
     sessionKey: params.sessionKey,
     sandboxName: runtime.sandboxName,
     endpoint: runtime.endpoint,
+    toolServiceEndpoint: runtime.toolService?.endpoint,
     workdir: runtime.workdir,
     workspaceDir: runtime.workspaceDir,
     agentWorkspaceDir: runtime.agentWorkspaceDir,
@@ -602,10 +656,22 @@ export async function createAgentBenchSandboxBackend(
       return result;
     },
     createFsBridge: ({ sandbox }) =>
-      createRemoteShellSandboxFsBridge({
-        sandbox,
-        runtime: handle,
-      }),
+      runtime.toolService
+        ? createAgentBenchToolServiceFsBridge({
+            sandbox,
+            runtime: {
+              ...runtime.toolService,
+              sandboxName: runtime.sandboxName,
+              sessionKey: params.sessionKey,
+              runMetadata: agentBenchRunMetadataEnv(),
+              remoteWorkspaceDir: runtime.workspaceDir,
+              remoteAgentWorkspaceDir: runtime.agentWorkspaceDir,
+            },
+          })
+        : createRemoteShellSandboxFsBridge({
+            sandbox,
+            runtime: handle,
+          }),
     runRemoteShellScript: async (command: SandboxBackendCommandParams) =>
       await handle.runShellCommand(command),
   };
