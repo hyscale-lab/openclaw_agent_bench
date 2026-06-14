@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  AGENT_BENCH_SANDBOX_FS_EXTRA_MOUNTS_ENV,
   AGENT_BENCH_SANDBOX_NAME_ENV,
   AGENT_BENCH_TOOL_BRIDGE_ENDPOINT_ENV,
   agentBenchSandboxBackendManager,
@@ -281,6 +282,39 @@ describe("agent-bench sandbox backend", () => {
             );
           },
         );
+      });
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "passes configured extra filesystem mounts to the remote bridge",
+    async () => {
+      await withTempDir("openclaw-agent-bench-backend-", async (stateDir) => {
+        const workspaceDir = path.join(stateDir, "workspace");
+        await fs.mkdir(workspaceDir, { recursive: true });
+        stubRequiredAgentBenchEnv({ endpoint: "http://127.0.0.1:19010" });
+        vi.stubEnv(AGENT_BENCH_SANDBOX_FS_EXTRA_MOUNTS_ENV, JSON.stringify(["/:rw"]));
+
+        const backend = await createAgentBenchSandboxBackend(
+          createBackendParams({ workspaceDir, agentWorkspaceDir: workspaceDir }),
+        );
+        const bridge = backend.createFsBridge?.({
+          sandbox: createSandboxTestContext({
+            overrides: {
+              workspaceDir,
+              agentWorkspaceDir: workspaceDir,
+              workspaceAccess: "rw",
+              containerWorkdir: "/app",
+            },
+          }),
+        });
+
+        expect(bridge?.resolvePath({ filePath: "/tmp/CompCert/Makefile" })).toMatchObject({
+          containerPath: "/tmp/CompCert/Makefile",
+        });
+        expect(bridge?.resolvePath({ filePath: "note.txt" })).toMatchObject({
+          containerPath: "/app/note.txt",
+        });
       });
     },
   );

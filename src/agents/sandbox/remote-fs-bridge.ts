@@ -17,7 +17,7 @@ import {
 } from "./path-utils.js";
 import { isExistingWorkspaceSkillMountSource } from "./workspace-mounts.js";
 
-type RemoteMountSource = "workspace" | "agent" | "protectedSkill";
+type RemoteMountSource = "workspace" | "agent" | "extra" | "protectedSkill";
 
 type ResolvedRemotePath = SandboxResolvedPath & {
   writable: boolean;
@@ -43,7 +43,13 @@ type MountInfo = {
 export type RemoteShellSandboxHandle = {
   remoteWorkspaceDir: string;
   remoteAgentWorkspaceDir: string;
+  remoteFsExtraMounts?: readonly RemoteShellSandboxExtraMount[];
   runRemoteShellScript(params: SandboxBackendCommandParams): Promise<SandboxBackendCommandResult>;
+};
+
+export type RemoteShellSandboxExtraMount = {
+  containerRoot: string;
+  writable: boolean;
 };
 
 export function createRemoteShellSandboxFsBridge(params: {
@@ -294,6 +300,7 @@ class RemoteShellSandboxFsBridge implements SandboxFsBridge {
         }),
       );
     }
+    mounts.push(...buildRemoteExtraMounts(this.runtime.remoteFsExtraMounts ?? []));
     return mounts;
   }
 
@@ -363,7 +370,7 @@ class RemoteShellSandboxFsBridge implements SandboxFsBridge {
             : path.posix.relative(this.runtime.remoteWorkspaceDir, params.containerPath)
           : relative === "."
             ? params.mount.containerRoot
-            : `${params.mount.containerRoot}/${relative}`,
+            : path.posix.join(params.mount.containerRoot, relative),
       containerPath: params.containerPath,
       writable: params.mount.writable,
       mountRootPath: params.mount.containerRoot,
@@ -612,6 +619,25 @@ class RemoteShellSandboxFsBridge implements SandboxFsBridge {
       allowFailure: params.allowFailure,
     });
   }
+}
+
+function buildRemoteExtraMounts(mounts: readonly RemoteShellSandboxExtraMount[]): MountInfo[] {
+  const result: MountInfo[] = [];
+  const seen = new Set<string>();
+  for (const mount of mounts) {
+    const containerRoot = normalizeContainerPath(mount.containerRoot);
+    if (seen.has(containerRoot)) {
+      continue;
+    }
+    seen.add(containerRoot);
+    result.push({
+      localRoot: containerRoot,
+      containerRoot,
+      writable: mount.writable,
+      source: "extra",
+    });
+  }
+  return result;
 }
 
 function buildRemoteProtectedSkillMounts(params: {

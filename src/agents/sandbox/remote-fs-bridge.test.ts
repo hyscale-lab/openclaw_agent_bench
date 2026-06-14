@@ -147,6 +147,67 @@ describe("remote sandbox fs bridge", () => {
     },
   );
 
+  it.runIf(process.platform !== "win32")(
+    "reads absolute paths from configured extra remote mounts",
+    async () => {
+      await withTempDir("openclaw-remote-fs-bridge-", async (stateDir) => {
+        const workspaceDir = path.join(stateDir, "workspace");
+        const extraDir = path.join(stateDir, "tmp");
+        await fs.mkdir(workspaceDir, { recursive: true });
+        await fs.mkdir(extraDir, { recursive: true });
+        await fs.writeFile(path.join(extraDir, "note.txt"), "outside", "utf8");
+
+        const { runtime } = createLocalRemoteRuntime({
+          remoteWorkspaceDir: workspaceDir,
+          remoteAgentWorkspaceDir: workspaceDir,
+        });
+        runtime.remoteFsExtraMounts = [{ containerRoot: extraDir, writable: true }];
+        const bridge = createRemoteShellSandboxFsBridge({
+          sandbox: createSandbox({
+            workspaceDir,
+            agentWorkspaceDir: workspaceDir,
+          }),
+          runtime,
+        });
+
+        await expect(
+          bridge.readFile({ filePath: path.join(extraDir, "note.txt") }),
+        ).resolves.toEqual(Buffer.from("outside"));
+      });
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "keeps relative paths anchored to the workspace when root is an extra mount",
+    async () => {
+      await withTempDir("openclaw-remote-fs-bridge-", async (stateDir) => {
+        const workspaceDir = path.join(stateDir, "workspace");
+        await fs.mkdir(workspaceDir, { recursive: true });
+        await fs.writeFile(path.join(workspaceDir, "note.txt"), "workspace", "utf8");
+
+        const { runtime } = createLocalRemoteRuntime({
+          remoteWorkspaceDir: workspaceDir,
+          remoteAgentWorkspaceDir: workspaceDir,
+        });
+        runtime.remoteFsExtraMounts = [{ containerRoot: "/", writable: true }];
+        const bridge = createRemoteShellSandboxFsBridge({
+          sandbox: createSandbox({
+            workspaceDir,
+            agentWorkspaceDir: workspaceDir,
+          }),
+          runtime,
+        });
+
+        expect(bridge.resolvePath({ filePath: "note.txt" })).toMatchObject({
+          containerPath: path.posix.join(workspaceDir, "note.txt"),
+        });
+        await expect(bridge.readFile({ filePath: "note.txt" })).resolves.toEqual(
+          Buffer.from("workspace"),
+        );
+      });
+    },
+  );
+
   it.runIf(process.platform !== "win32")("rejects symlink escapes while reading", async () => {
     await withTempDir("openclaw-remote-fs-bridge-", async (stateDir) => {
       const workspaceDir = path.join(stateDir, "workspace");

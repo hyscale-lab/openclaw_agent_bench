@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
+import path from "node:path";
 import type {
   SandboxBackendCommandParams,
   SandboxBackendCommandResult,
@@ -11,6 +12,7 @@ import type {
 } from "./backend.types.js";
 import {
   createRemoteShellSandboxFsBridge,
+  type RemoteShellSandboxExtraMount,
   type RemoteShellSandboxHandle,
 } from "./remote-fs-bridge.js";
 import { sanitizeEnvVars } from "./sanitize-env-vars.js";
@@ -22,6 +24,7 @@ export const AGENT_BENCH_SANDBOX_WORKDIR_ENV = "AGENT_BENCH_SANDBOX_WORKDIR";
 export const AGENT_BENCH_SANDBOX_WORKSPACE_DIR_ENV = "AGENT_BENCH_SANDBOX_WORKSPACE_DIR";
 export const AGENT_BENCH_SANDBOX_AGENT_WORKSPACE_DIR_ENV =
   "AGENT_BENCH_SANDBOX_AGENT_WORKSPACE_DIR";
+export const AGENT_BENCH_SANDBOX_FS_EXTRA_MOUNTS_ENV = "AGENT_BENCH_SANDBOX_FS_EXTRA_MOUNTS";
 export const AGENT_BENCH_TOOL_BRIDGE_COMMAND_TIMEOUT_MS_ENV =
   "AGENT_BENCH_TOOL_BRIDGE_COMMAND_TIMEOUT_MS";
 export const AGENT_BENCH_RUN_ID_ENV = "AGENT_BENCH_RUN_ID";
@@ -39,6 +42,7 @@ const BRIDGE_HTTP_PASS_THROUGH_ENV = [
   AGENT_BENCH_SANDBOX_WORKDIR_ENV,
   AGENT_BENCH_SANDBOX_WORKSPACE_DIR_ENV,
   AGENT_BENCH_SANDBOX_AGENT_WORKSPACE_DIR_ENV,
+  AGENT_BENCH_SANDBOX_FS_EXTRA_MOUNTS_ENV,
   AGENT_BENCH_RUN_ID_ENV,
   AGENT_BENCH_RUN_NAME_ENV,
   AGENT_BENCH_BENCHMARK_KIND_ENV,
@@ -51,6 +55,7 @@ type AgentBenchBridgeRuntime = {
   workdir: string;
   workspaceDir: string;
   agentWorkspaceDir: string;
+  fsExtraMounts: RemoteShellSandboxExtraMount[];
   commandTimeoutMs?: number;
 };
 
@@ -263,6 +268,124 @@ function normalizePositiveInteger(value: number | undefined): number | undefined
   return Math.floor(value);
 }
 
+function normalizeAgentBenchFsExtraMount(params: {
+  containerRoot: unknown;
+  writable: unknown;
+  label: string;
+}): RemoteShellSandboxExtraMount {
+  if (typeof params.containerRoot !== "string" || !params.containerRoot.trim()) {
+    throw new Error(
+      `Agent Bench sandbox backend requires ${params.label}.containerRoot to be a non-empty string.`,
+    );
+  }
+  const containerRoot = path.posix.normalize(params.containerRoot.trim().replace(/\\/g, "/"));
+  if (!path.posix.isAbsolute(containerRoot)) {
+    throw new Error(
+      `Agent Bench sandbox backend requires ${params.label}.containerRoot to be an absolute container path.`,
+    );
+  }
+  if (typeof params.writable !== "boolean") {
+    throw new Error(
+      `Agent Bench sandbox backend requires ${params.label}.writable to be a boolean.`,
+    );
+  }
+  return { containerRoot, writable: params.writable };
+}
+
+function parseAgentBenchFsExtraMountString(
+  value: string,
+  label: string,
+): RemoteShellSandboxExtraMount {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    throw new Error(`Agent Bench sandbox backend requires ${label} to be non-empty.`);
+  }
+  const delimiter = trimmed.lastIndexOf(":");
+  const suffix =
+    delimiter > 0
+      ? trimmed
+          .slice(delimiter + 1)
+          .trim()
+          .toLowerCase()
+      : "";
+  const hasMode = suffix === "ro" || suffix === "rw";
+  return normalizeAgentBenchFsExtraMount({
+    containerRoot: hasMode ? trimmed.slice(0, delimiter) : trimmed,
+    writable: hasMode ? suffix === "rw" : true,
+    label,
+  });
+}
+
+function parseAgentBenchFsExtraMountEntry(
+  value: unknown,
+  label: string,
+): RemoteShellSandboxExtraMount {
+  if (typeof value === "string") {
+    return parseAgentBenchFsExtraMountString(value, label);
+  }
+  if (!isRecord(value)) {
+    throw new Error(`Agent Bench sandbox backend requires ${label} to be a string or object.`);
+  }
+  const root = value.containerRoot ?? value.root ?? value.path;
+  let writable: unknown = value.writable;
+  if (writable === undefined) {
+    const mode = typeof value.mode === "string" ? value.mode.trim().toLowerCase() : "";
+    if (mode === "ro" || mode === "readonly") {
+      writable = false;
+    } else if (mode === "" || mode === "rw" || mode === "readwrite") {
+      writable = true;
+    } else {
+      throw new Error(
+        `Agent Bench sandbox backend requires ${label}.mode to be "ro" or "rw" when set.`,
+      );
+    }
+  }
+  return normalizeAgentBenchFsExtraMount({
+    containerRoot: root,
+    writable,
+    label,
+  });
+}
+
+function parseAgentBenchFsExtraMounts(): RemoteShellSandboxExtraMount[] {
+  const value = readTrimmedEnv(AGENT_BENCH_SANDBOX_FS_EXTRA_MOUNTS_ENV);
+  if (!value) {
+    return [];
+  }
+  let rawEntries: unknown;
+  try {
+    rawEntries = JSON.parse(value);
+  } catch {
+    rawEntries = value.split(",");
+  }
+  if (!Array.isArray(rawEntries)) {
+    throw new Error(
+      `Agent Bench sandbox backend requires ${AGENT_BENCH_SANDBOX_FS_EXTRA_MOUNTS_ENV} to be a JSON array.`,
+    );
+  }
+
+  const mounts: RemoteShellSandboxExtraMount[] = [];
+  const seen = new Map<string, boolean>();
+  for (const [index, entry] of rawEntries.entries()) {
+    const mount = parseAgentBenchFsExtraMountEntry(
+      entry,
+      `${AGENT_BENCH_SANDBOX_FS_EXTRA_MOUNTS_ENV}[${index}]`,
+    );
+    const previousWritable = seen.get(mount.containerRoot);
+    if (previousWritable !== undefined) {
+      if (previousWritable !== mount.writable) {
+        throw new Error(
+          `Agent Bench sandbox backend has conflicting extra fs mount permissions for ${mount.containerRoot}.`,
+        );
+      }
+      continue;
+    }
+    seen.set(mount.containerRoot, mount.writable);
+    mounts.push(mount);
+  }
+  return mounts;
+}
+
 function resolveRequestTimeoutMs(...candidates: Array<number | undefined>): number {
   for (const candidate of candidates) {
     const normalized = normalizePositiveInteger(candidate);
@@ -325,6 +448,7 @@ function resolveAgentBenchRuntime(params: CreateSandboxBackendParams): AgentBenc
   const workspaceDir = readTrimmedEnv(AGENT_BENCH_SANDBOX_WORKSPACE_DIR_ENV) ?? workdir;
   const agentWorkspaceDir =
     readTrimmedEnv(AGENT_BENCH_SANDBOX_AGENT_WORKSPACE_DIR_ENV) ?? workspaceDir;
+  const fsExtraMounts = parseAgentBenchFsExtraMounts();
 
   return {
     endpoint: resolveToolBridgeExecUrl(requireEnv(AGENT_BENCH_TOOL_BRIDGE_ENDPOINT_ENV)),
@@ -332,6 +456,7 @@ function resolveAgentBenchRuntime(params: CreateSandboxBackendParams): AgentBenc
     workdir,
     workspaceDir,
     agentWorkspaceDir,
+    fsExtraMounts,
     commandTimeoutMs: parsePositiveIntegerEnv(AGENT_BENCH_TOOL_BRIDGE_COMMAND_TIMEOUT_MS_ENV),
   };
 }
@@ -355,6 +480,9 @@ function buildBridgeHttpClientEnv(
   env[AGENT_BENCH_SANDBOX_WORKDIR_ENV] = runtime.workdir;
   env[AGENT_BENCH_SANDBOX_WORKSPACE_DIR_ENV] = runtime.workspaceDir;
   env[AGENT_BENCH_SANDBOX_AGENT_WORKSPACE_DIR_ENV] = runtime.agentWorkspaceDir;
+  if (runtime.fsExtraMounts.length > 0) {
+    env[AGENT_BENCH_SANDBOX_FS_EXTRA_MOUNTS_ENV] = JSON.stringify(runtime.fsExtraMounts);
+  }
   return env;
 }
 
@@ -522,6 +650,7 @@ export async function createAgentBenchSandboxBackend(
     workdir: runtime.workdir,
     workspaceDir: runtime.workspaceDir,
     agentWorkspaceDir: runtime.agentWorkspaceDir,
+    fsExtraMounts: runtime.fsExtraMounts,
   });
   const handle: SandboxBackendHandle & RemoteShellSandboxHandle = {
     id: "agent-bench",
@@ -532,6 +661,7 @@ export async function createAgentBenchSandboxBackend(
     configLabelKind: "Sandbox",
     remoteWorkspaceDir: runtime.workspaceDir,
     remoteAgentWorkspaceDir: runtime.agentWorkspaceDir,
+    remoteFsExtraMounts: runtime.fsExtraMounts,
     buildExecSpec: async ({ command, workdir, env, timeoutMs }) => {
       const cwd = workdir ?? runtime.workdir;
       const argv = ["/bin/sh", "-lc", command];
